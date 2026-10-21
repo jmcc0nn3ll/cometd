@@ -25,6 +25,7 @@ import java.util.Map;
 import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 import jakarta.websocket.ClientEndpointConfig;
@@ -98,6 +99,72 @@ public class BayeuxClientWebSocketTest extends ClientServerWebSocketTest {
         startServer();
 
         Assertions.assertTrue(connectLatch.await(5, TimeUnit.SECONDS));
+
+        disconnectBayeuxClient(client);
+    }
+
+    @ParameterizedTest
+    @MethodSource("transports")
+    public void testHandshakeWithNoTransportLeft(Transport wsType) throws Exception {
+        // OkHttp keeps accepting after a refused upgrade, and rehandshakes instead.
+        Assumptions.assumeTrue(wsType != Transport.WEBSOCKET_OKHTTP);
+
+        prepareAndStart(wsType, null);
+
+        // No CometD at this path, so the WebSocket upgrade is refused.
+        String url = "http://localhost:" + connector.getLocalPort() + "/no_cometd";
+        BayeuxClient client = new BayeuxClient(url, newWebSocketTransport(wsType, null));
+        BlockingQueue<Message> failures = new BlockingArrayQueue<>();
+        client.getChannel(Channel.META_HANDSHAKE).addListener((ClientSessionChannel.MessageListener)(channel, message) -> {
+            if (!message.isSuccessful()) {
+                failures.offer(message);
+            }
+        });
+
+        client.handshake();
+        Assertions.assertTrue(client.waitFor(5000, BayeuxClient.State.DISCONNECTED));
+        // The refused upgrade leaves the only transport not accepting.
+        Assertions.assertFalse(client.getTransport("websocket").accept(BayeuxClient.BAYEUX_VERSION));
+        Assertions.assertNotNull(failures.poll(5, TimeUnit.SECONDS));
+
+        for (int i = 0; i < 2; ++i) {
+            BlockingQueue<Message> replies = new BlockingArrayQueue<>();
+            client.handshake(replies::offer);
+            Message reply = replies.poll(5, TimeUnit.SECONDS);
+            Assertions.assertNotNull(reply);
+            Assertions.assertFalse(reply.isSuccessful());
+            Assertions.assertEquals("405:c[websocket]:no_transport", reply.get(Message.ERROR_FIELD));
+            Message failure = failures.poll(5, TimeUnit.SECONDS);
+            Assertions.assertNotNull(failure);
+            Assertions.assertEquals(reply.getId(), failure.getId());
+            Assertions.assertTrue(client.waitFor(5000, BayeuxClient.State.DISCONNECTED));
+        }
+    }
+
+    @ParameterizedTest
+    @MethodSource("transports")
+    public void testThrowingActionDoesNotFreezeClient(Transport wsType) throws Exception {
+        prepareAndStart(wsType, null);
+
+        AtomicBoolean fail = new AtomicBoolean(true);
+        BayeuxClient client = new BayeuxClient(cometdURL, newWebSocketTransport(wsType, null)) {
+            @Override
+            protected void initialize() {
+                if (fail.compareAndSet(true, false)) {
+                    throw new IllegalStateException("explicitly_thrown_by_test");
+                }
+                super.initialize();
+            }
+        };
+
+        // The handshake action throws after the state is HANDSHAKING,
+        // before a transport is picked; abort() must still run.
+        client.handshake();
+        client.abort();
+        Assertions.assertTrue(client.waitFor(5000, BayeuxClient.State.DISCONNECTED));
+
+        client.handshake();
+        Assertions.assertTrue(client.waitFor(5000, BayeuxClient.State.CONNECTED));
 
         disconnectBayeuxClient(client);
     }

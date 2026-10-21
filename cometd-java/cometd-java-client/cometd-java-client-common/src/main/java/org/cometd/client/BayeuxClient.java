@@ -1390,8 +1390,15 @@ public class BayeuxClient extends AbstractClientSession implements Bayeux {
                 initialize();
 
                 List<String> allowedTransports = getAllowedTransports();
+                List<ClientTransport> transports = transportRegistry.negotiate(allowedTransports.toArray(), BAYEUX_VERSION);
+                if (transports.isEmpty()) {
+                    // No transport accepts, for example the only transport
+                    // is WebSocket and a previous upgrade was refused.
+                    noTransport(handshakeFields, handshakeCallback, allowedTransports);
+                    return;
+                }
                 // Pick the first transport for the handshake, it will renegotiate if not right
-                ClientTransport transport = transportRegistry.negotiate(allowedTransports.toArray(), BAYEUX_VERSION).get(0);
+                ClientTransport transport = transports.get(0);
                 prepareTransport(null, transport);
                 if (logger.isDebugEnabled()) {
                     logger.debug("Using initial transport {} from {}", transport.getName(), allowedTransports);
@@ -1406,6 +1413,30 @@ public class BayeuxClient extends AbstractClientSession implements Bayeux {
                 resetSubscriptions();
                 sendHandshake();
             }
+        }
+
+        private void noTransport(Map<String, Object> handshakeFields, ClientSession.MessageListener handshakeCallback, List<String> allowedTransports) {
+            if (logger.isDebugEnabled()) {
+                logger.debug("No transport available for handshake from {}", allowedTransports);
+            }
+
+            Message.Mutable handshake = newMessage();
+            if (handshakeFields != null) {
+                handshake.putAll(handshakeFields);
+            }
+            String messageId = newMessageId();
+            handshake.setId(messageId);
+            handshake.setChannel(Channel.META_HANDSHAKE);
+            registerCallback(messageId, handshakeCallback);
+
+            ClientTransport.FailureInfo failureInfo = new ClientTransport.FailureInfo();
+            failureInfo.transport = null;
+            failureInfo.cause = null;
+            failureInfo.error = String.format("405:c%s:no_transport", allowedTransports);
+            failureInfo.action = Message.RECONNECT_NONE_VALUE;
+            handshake.setSuccessful(false);
+            handshake.put(Message.ERROR_FIELD, failureInfo.error);
+            failHandshake(handshake, failureInfo);
         }
 
         private void rehandshaking(long backOff) {
@@ -1540,10 +1571,13 @@ public class BayeuxClient extends AbstractClientSession implements Bayeux {
         }
 
         private void terminate(Throwable failure) {
-            if (failure != null) {
-                transport.abort(failure);
-            } else {
-                transport.terminate();
+            // There is no transport if the handshake could not pick one.
+            if (transport != null) {
+                if (failure != null) {
+                    transport.abort(failure);
+                } else {
+                    transport.terminate();
+                }
             }
 
             BayeuxClient.this.terminate(failure);
@@ -1588,7 +1622,13 @@ public class BayeuxClient extends AbstractClientSession implements Bayeux {
                         active = looping = true;
                     }
                 }
-                action.run();
+                try {
+                    action.run();
+                } catch (Throwable x) {
+                    // Keep processing, otherwise this SessionState stays
+                    // active and every later action is only queued.
+                    logger.info("Failure while processing action " + action, x);
+                }
             }
         }
 
